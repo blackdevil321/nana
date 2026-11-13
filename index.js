@@ -12,44 +12,31 @@ function isRealSuccess(data) {
   return true;
 }
 
-// {{mobile}} aur {{mobileNum}} ko actual number se replace karta hai
 function interpolate(obj, mobile) {
   const num = String(parseInt(mobile, 10));
   if (typeof obj === 'string') {
-    return obj
-      .replace(/\{\{mobileNum\}\}/g, num)
-      .replace(/\{\{mobile\}\}/g, mobile);
+    return obj.replace(/\{\{mobileNum\}\}/g, num).replace(/\{\{mobile\}\}/g, mobile);
   }
-  if (Array.isArray(obj)) {
-    return obj.map(v => interpolate(v, mobile));
-  }
+  if (Array.isArray(obj)) return obj.map(v => interpolate(v, mobile));
   if (obj && typeof obj === 'object') {
     const out = {};
-    for (const k in obj) {
-      out[k] = interpolate(obj[k], mobile);
-    }
+    for (const k in obj) out[k] = interpolate(obj[k], mobile);
     return out;
   }
   return obj;
 }
 
-// Timeout lagata hai taaki ek API poori request ko na roke
 function withTimeout(promise, ms) {
   return Promise.race([
     promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
-    )
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms))
   ]);
 }
 
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj, null, 2), {
     status,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*'
-    }
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
   });
 }
 
@@ -67,18 +54,14 @@ async function runOne(key, cfg, mobile) {
   if (cfg.bodyRaw) {
     body = interpolate(cfg.bodyRaw, mobile);
   } else if (cfg.body) {
-    if (typeof cfg.body === 'string') {
-      body = interpolate(cfg.body, mobile);
-    } else {
-      body = JSON.stringify(interpolate(cfg.body, mobile));
-    }
+    if (typeof cfg.body === 'string') body = interpolate(cfg.body, mobile);
+    else body = JSON.stringify(interpolate(cfg.body, mobile));
   }
 
   try {
     const fetchPromise = fetch(url, { method, headers, body }).then(async res => {
       const text = await res.text();
-      let data; 
-      try { data = JSON.parse(text); } catch { data = text; }
+      let data; try { data = JSON.parse(text); } catch { data = text; }
       return { status: res.status, data };
     });
 
@@ -93,62 +76,67 @@ async function runOne(key, cfg, mobile) {
       response: data
     };
   } catch (e) {
-    return {
-      api: key,
-      name: cfg.name || key,
-      success: false,
-      error: e.message,
-      ms: Date.now() - start
-    };
+    return { api: key, name: cfg.name || key, success: false, error: e.message, ms: Date.now() - start };
   }
 }
 
 // ============================================================
-// WORKER ENTRY POINT
+// WORKER ENTRY POINT (RANDOM & AUTO-BATCH)
 // ============================================================
 export default {
   async fetch(request) {
     const url = new URL(request.url);
     const mobile = url.searchParams.get('mobile');
 
-    // CORS Preflight Handle
+    // CORS Handle
     if (request.method === 'OPTIONS') {
       return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, OPTIONS',
-          'Access-Control-Allow-Headers': '*'
-        }
+        headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Allow-Headers': '*' }
       });
     }
 
-    // Mobile number validation
     if (!mobile) return json({ error: 'Missing ?mobile' }, 400);
     const clean = mobile.replace(/\D/g, '');
     if (clean.length !== 10) return json({ error: 'Mobile must be exactly 10 digits' }, 400);
 
     const start = Date.now();
+    
+    // 1. Saari APIs ko array mein lo
+    const allApis = Object.entries(apisConfig);
+    
+    // 2. Unhe random (shuffle) kar do
+    const shuffledApis = allApis.sort(() => 0.5 - Math.random());
+    
+    // 3. Batch size set karo (45 is safe for Cloudflare's 50 limit)
+    const chunkSize = 45; 
+    const allResults = [];
 
-    // Saari APIs ko ek saath (parallel) run karo
-    const settled = await Promise.allSettled(
-      Object.entries(apisConfig).map(([k, c]) => runOne(k, c, clean))
-    );
+    // 4. Loop chalao 45-45 karke
+    for (let i = 0; i < shuffledApis.length; i += chunkSize) {
+      const chunk = shuffledApis.slice(i, i + chunkSize);
+      
+      // Har chunk ko parallel run karo
+      const settled = await Promise.allSettled(
+        chunk.map(([k, c]) => runOne(k, c, clean))
+      );
 
-    // Results ko format karo
-    const results = settled.map(r =>
-      r.status === 'fulfilled' ? r.value : { success: false, error: r.reason?.message }
-    );
+      const chunkResults = settled.map(r => 
+        r.status === 'fulfilled' ? r.value : { success: false, error: r.reason?.message }
+      );
 
-    const successCount = results.filter(r => r.success).length;
+      allResults.push(...chunkResults);
+    }
 
-    // Final response
+    const successCount = allResults.filter(r => r.success).length;
+
+    // Final Response
     return json({
       mobile: clean,
-      total: results.length,
+      total: allResults.length,
       success: successCount,
-      failed: results.length - successCount,
+      failed: allResults.length - successCount,
       totalTimeMs: Date.now() - start,
-      results
+      results: allResults
     });
   }
 };
